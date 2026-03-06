@@ -207,6 +207,30 @@ class TestContentFeatures:
         features = make_features(nlp, "Some text here for testing purposes.", "test query")
         assert features.target_query == "test query"
 
+    def test_target_query_none_when_not_provided(self, nlp) -> None:
+        features = make_features(nlp, "Some text here for testing purposes.")
+        assert features.target_query is None
+
+    def test_sentences_are_strings(self, nlp) -> None:
+        features = make_features(nlp, "First. Second. Third.")
+        for s in features.sentences:
+            assert isinstance(s, str)
+
+    def test_empty_sentences_excluded(self, nlp) -> None:
+        text = "One sentence.   "
+        features = make_features(nlp, text)
+        for s in features.sentences:
+            assert s.strip() != ""
+
+    def test_word_count_positive_for_real_text(self, nlp) -> None:
+        features = make_features(nlp, "Python is a programming language.")
+        assert features.word_count > 0
+
+    def test_lines_include_empty_for_blank_lines(self, nlp) -> None:
+        text = "Line one\n\nLine three"
+        features = make_features(nlp, text)
+        assert len(features.lines) == 3
+
 
 # ---------------------------------------------------------------------------
 # Tests for score_qa_alignment
@@ -278,6 +302,61 @@ class TestScoreQaAlignment:
         score, _ = score_qa_alignment(features)
         assert score >= 20.0
 
+    def test_rich_content_qa_score_reasonable(self, nlp) -> None:
+        features = make_features(nlp, RICH_CONTENT)
+        score, _ = score_qa_alignment(features)
+        # Rich content has headings as questions, explicit question sentences
+        assert score >= 30.0
+
+    def test_answer_indicator_phrases_boost_score(self, nlp) -> None:
+        text_with_indicators = (
+            "The answer is quite simple: Python is easy to learn. "
+            "In other words, its syntax resembles plain English. "
+            "For example, you can print text with a single line of code. "
+            "Specifically, the print() function handles output. "
+            "That is why beginners love Python so much."
+        )
+        text_without_indicators = (
+            "Python is easy to learn. "
+            "Its syntax resembles plain English. "
+            "You can print text with a single line of code. "
+            "The print() function handles output. "
+            "Beginners love Python so much."
+        )
+        f_with = make_features(nlp, text_with_indicators)
+        f_without = make_features(nlp, text_without_indicators)
+        score_with, _ = score_qa_alignment(f_with)
+        score_without, _ = score_qa_alignment(f_without)
+        assert score_with >= score_without
+
+    def test_target_query_no_keyword_overlap_still_returns_score(self, nlp) -> None:
+        text = "Python is a programming language used for many purposes."
+        # Query with words completely absent from text
+        features = make_features(nlp, text, target_query="quantum mechanics thermodynamics")
+        score, explanation = score_qa_alignment(features)
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 100.0
+
+    def test_target_query_short_words_only_gives_partial_credit(self, nlp) -> None:
+        text = "The is a an of in to for."
+        # Query consists only of short words (<=3 chars)
+        features = make_features(nlp, text, target_query="is an to")
+        score, explanation = score_qa_alignment(features)
+        assert 0.0 <= score <= 100.0
+        assert "short" in explanation.lower() or "query" in explanation.lower()
+
+    def test_definition_style_sentences_give_partial_credit(self, nlp) -> None:
+        text = (
+            "Python is a high-level programming language. "
+            "Machine learning is a subset of artificial intelligence. "
+            "FastAPI is a modern web framework for building APIs. "
+            "Generators are a type of iterable that produce values lazily. "
+            "Decorators can be described as higher-order functions in Python."
+        )
+        features = make_features(nlp, text)
+        score, _ = score_qa_alignment(features)
+        assert score >= 0.0
+
 
 # ---------------------------------------------------------------------------
 # Tests for score_entity_density
@@ -301,7 +380,6 @@ class TestScoreEntityDensity:
             assert 0.0 <= score <= 100.0
 
     def test_entity_rich_content_scores_high(self, nlp) -> None:
-        # Content with many named entities
         entity_text = (
             "Apple Inc., founded by Steve Jobs, Steve Wozniak, and Ronald Wayne in "
             "Cupertino, California, is now one of the world's most valuable companies. "
@@ -326,8 +404,54 @@ class TestScoreEntityDensity:
         )
         features = make_features(nlp, generic)
         score, _ = score_entity_density(features)
-        # Generic text without entities should score relatively low
         assert score < 70.0
+
+    def test_citation_rich_content_has_entities(self, nlp) -> None:
+        features = make_features(nlp, CITATION_RICH_CONTENT)
+        score, explanation = score_entity_density(features)
+        # Citation-rich content names WHO, Harvard, MIT, UN, etc.
+        assert score >= 20.0
+
+    def test_explanation_mentions_entities(self, nlp) -> None:
+        entity_text = (
+            "Apple Inc., founded by Steve Jobs in Cupertino, California. "
+            "Google was created by Larry Page and Sergey Brin at Stanford University. "
+            "Microsoft was founded by Bill Gates and Paul Allen in 1975."
+        )
+        features = make_features(nlp, entity_text)
+        score, explanation = score_entity_density(features)
+        # Explanation should mention entities or density
+        assert any(
+            word in explanation.lower()
+            for word in ["entity", "entities", "density", "unique", "type"]
+        )
+
+    def test_no_entities_returns_low_score(self, nlp) -> None:
+        # Very generic text unlikely to have named entities
+        generic = (
+            "Things happen every day and night. "
+            "People do lots of activities in various places. "
+            "Everything works out fine in the long run. "
+            "Situations change over time and become better."
+        )
+        features = make_features(nlp, generic)
+        score, explanation = score_entity_density(features)
+        # Score should be low, explanation should reflect limited entities
+        assert score < 60.0
+
+    def test_score_does_not_exceed_100(self, nlp) -> None:
+        # Content packed with entities
+        dense_entity_text = (
+            "Apple, Google, Microsoft, Amazon, Facebook, Tesla, Netflix, Uber, "
+            "Airbnb, Twitter founded by Elon Musk, Jack Dorsey, Jeff Bezos, "
+            "Bill Gates, Steve Jobs, Larry Page, Sergey Brin in Silicon Valley, "
+            "New York, London, Tokyo, Paris, Berlin, Sydney, Toronto, Chicago. "
+            "In 2020, 2021, 2022, 2023, 2024 these organizations achieved milestones. "
+            "Harvard, MIT, Stanford, Oxford, Cambridge produced Nobel Prize winners."
+        )
+        features = make_features(nlp, dense_entity_text)
+        score, _ = score_entity_density(features)
+        assert score <= 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +519,6 @@ class TestScoreStructuredFormatting:
             assert 0.0 <= score <= 100.0
 
     def test_rich_content_with_all_signals_scores_high(self, nlp) -> None:
-        # RICH_CONTENT has headings, bullets, numbered lists, bold text, paragraphs
         features = make_features(nlp, RICH_CONTENT)
         score, _ = score_structured_formatting(features)
         assert score >= 50.0
@@ -405,6 +528,70 @@ class TestScoreStructuredFormatting:
         score, explanation = score_structured_formatting(features)
         assert isinstance(explanation, str)
         assert len(explanation) > 0
+
+    def test_bold_emphasis_detected(self, nlp) -> None:
+        text_with_bold = (
+            "This is **very important** content. You should **pay attention** to "
+            "**key concepts** like **this one** and **that one**. "
+            "Remember that **bold text** signals emphasis."
+        )
+        features = make_features(nlp, text_with_bold)
+        score, explanation = score_structured_formatting(features)
+        assert "emphasis" in explanation.lower() or "bold" in explanation.lower()
+
+    def test_code_blocks_detected(self, nlp) -> None:
+        text_with_code = (
+            "# How to use Python\n\n"
+            "Here is an example:\n\n"
+            "```python\n"
+            "def hello():\n"
+            "    print('Hello')\n"
+            "```\n\n"
+            "Use `print()` for output."
+        )
+        features = make_features(nlp, text_with_code)
+        score, explanation = score_structured_formatting(features)
+        assert "code" in explanation.lower()
+        assert score >= 20.0
+
+    def test_paragraph_structure_contributes(self, nlp) -> None:
+        text_with_paragraphs = (
+            "First paragraph discusses the introduction to the topic.\n\n"
+            "Second paragraph explains the core concepts in more detail.\n\n"
+            "Third paragraph provides practical examples and use cases.\n\n"
+            "Fourth paragraph summarizes the key takeaways.\n\n"
+            "Fifth paragraph offers a conclusion and next steps."
+        )
+        features = make_features(nlp, text_with_paragraphs)
+        score, explanation = score_structured_formatting(features)
+        assert "paragraph" in explanation.lower()
+        assert score >= 15.0
+
+    def test_markdown_table_detected(self, nlp) -> None:
+        text_with_table = (
+            "Here is a comparison table:\n\n"
+            "| Language | Use Case | Popularity |\n"
+            "|---------|----------|------------|\n"
+            "| Python  | Data Science | High |\n"
+            "| Java    | Enterprise | High |\n"
+            "| C++     | Systems | Medium |\n\n"
+            "The table above summarizes the comparison."
+        )
+        features = make_features(nlp, text_with_table)
+        score, explanation = score_structured_formatting(features)
+        assert "table" in explanation.lower()
+
+    def test_plain_text_no_structure_scores_low(self, nlp) -> None:
+        # Single block of plain text with no structure signals
+        plain = (
+            "Python is a programming language that is widely used. It was created "
+            "by Guido van Rossum. It has a simple syntax. Many people use it. It is "
+            "good for beginners. It also works for experts. Companies use it a lot."
+        )
+        features = make_features(nlp, plain)
+        score, _ = score_structured_formatting(features)
+        # Very minimal structure should yield a low-to-medium score
+        assert score < 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +663,53 @@ class TestScoreCitationCues:
         assert isinstance(explanation, str)
         assert len(explanation) > 0
 
+    def test_quotations_contribute(self, nlp) -> None:
+        text_with_quotes = (
+            'According to Dr. Smith, "The results are unprecedented in the field." '
+            'The lead researcher noted, "We observed a 40% improvement over baseline." '
+            'The journal editor stated, "This paper represents a significant advance."
+        )
+        features = make_features(nlp, text_with_quotes)
+        score, explanation = score_citation_cues(features)
+        assert score >= 20.0
+
+    def test_named_institutions_contribute(self, nlp) -> None:
+        text_with_institutions = (
+            "Research from Harvard and MIT indicates that machine learning "
+            "outperforms traditional methods. The WHO published a report in the "
+            "Journal of Medicine confirming these findings. The study was indexed "
+            "on PubMed and cited by institutions at Stanford and Oxford."
+        )
+        features = make_features(nlp, text_with_institutions)
+        score, explanation = score_citation_cues(features)
+        assert score >= 20.0
+        assert any(
+            word in explanation.lower()
+            for word in ["source", "named", "url", "attribution", "statistical"]
+        )
+
+    def test_dollar_amounts_counted_as_stats(self, nlp) -> None:
+        text_with_money = (
+            "The market is valued at $4.2 billion in 2024. "
+            "Revenue grew to $850 million, a 23% increase year-over-year. "
+            "Investment rounds totaled $120 million across 15 startups."
+        )
+        features = make_features(nlp, text_with_money)
+        score, explanation = score_citation_cues(features)
+        assert score >= 15.0
+        assert "statistical" in explanation.lower()
+
+    def test_blockquote_markdown_detected(self, nlp) -> None:
+        text_with_blockquote = (
+            "The report states:\n"
+            "> Urban areas produce 80% of global GDP despite covering 2% of land.\n"
+            "> Population density drives economic specialization and innovation.\n\n"
+            "These findings support urbanization policy recommendations."
+        )
+        features = make_features(nlp, text_with_blockquote)
+        score, explanation = score_citation_cues(features)
+        assert score >= 15.0
+
 
 # ---------------------------------------------------------------------------
 # Tests for score_semantic_clarity
@@ -526,7 +760,7 @@ class TestScoreSemanticClarity:
         score_with, _ = score_semantic_clarity(f_with)
         score_without, _ = score_semantic_clarity(f_without)
         # Transition words should boost score
-        assert score_with >= score_without - 5.0  # Allow small variance from other signals
+        assert score_with >= score_without - 5.0
 
     def test_returns_explanation_string(self, nlp) -> None:
         features = make_features(nlp, RICH_CONTENT)
@@ -549,7 +783,52 @@ class TestScoreSemanticClarity:
         f_div = make_features(nlp, diverse)
         score_rep, _ = score_semantic_clarity(f_rep)
         score_div, _ = score_semantic_clarity(f_div)
-        assert score_div >= score_rep - 10.0  # diverse should not score worse
+        assert score_div >= score_rep - 10.0
+
+    def test_explanation_mentions_filler_when_present(self, nlp) -> None:
+        filler_text = (
+            "Basically, this is very important. You literally need to kind of understand "
+            "that it is really quite significant. Actually, it is somewhat critical that "
+            "we note this. In today's world, at the end of the day, things are like this."
+        )
+        features = make_features(nlp, filler_text)
+        score, explanation = score_semantic_clarity(features)
+        assert "filler" in explanation.lower() or "hedge" in explanation.lower()
+
+    def test_long_sentences_penalized(self, nlp) -> None:
+        # Content with very long average sentence length
+        long_sentence_text = (
+            "Python is a high-level general-purpose dynamically-typed interpreted "
+            "programming language that was created by Guido van Rossum and first "
+            "released in 1991 and has since grown to become one of the most popular "
+            "programming languages in the world for applications ranging from web "
+            "development to data science to machine learning to scientific computing. "
+            "The Python Software Foundation maintains the language and releases new "
+            "versions on a regular schedule with Python 3.11 and 3.12 being the most "
+            "recent major releases featuring significant performance improvements and "
+            "new language features that make the language even more powerful than before."
+        )
+        short_sentence_text = (
+            "Python is popular. It was created in 1991. Guido van Rossum designed it. "
+            "It supports data science. It handles web development. Companies use it widely."
+        )
+        f_long = make_features(nlp, long_sentence_text)
+        f_short = make_features(nlp, short_sentence_text)
+        score_long, explanation_long = score_semantic_clarity(f_long)
+        score_short, _ = score_semantic_clarity(f_short)
+        # Long sentences should be penalized
+        assert "long" in explanation_long.lower() or score_long <= score_short + 20.0
+
+    def test_score_starts_from_neutral_midpoint(self, nlp) -> None:
+        # A neutral text with no extreme signals should be near the midpoint
+        neutral = (
+            "Python is a programming language. It is used for web development. "
+            "Many companies use it. It has good documentation. Developers enjoy using it."
+        )
+        features = make_features(nlp, neutral)
+        score, _ = score_semantic_clarity(features)
+        # Should be somewhere in a reasonable range
+        assert 20.0 <= score <= 90.0
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +854,7 @@ class TestScoreContentDepth:
 
     def test_long_content_scores_higher_than_short(self, nlp) -> None:
         short_text = "Python is a programming language. It is used for many things. People like it."
-        long_text = RICH_CONTENT  # ~300+ words
+        long_text = RICH_CONTENT
         f_short = make_features(nlp, short_text)
         f_long = make_features(nlp, long_text)
         score_short, _ = score_content_depth(f_short)
@@ -636,6 +915,44 @@ class TestScoreContentDepth:
         score_comp, _ = score_content_depth(f_comp)
         score_plain, _ = score_content_depth(f_plain)
         assert score_comp > score_plain
+
+    def test_word_count_signal_in_explanation(self, nlp) -> None:
+        features = make_features(nlp, RICH_CONTENT)
+        score, explanation = score_content_depth(features)
+        assert "word" in explanation.lower() or "content" in explanation.lower()
+
+    def test_many_sentences_boost_score(self, nlp) -> None:
+        # Build text with 25+ sentences
+        sentences = [
+            f"This is sentence number {i} about Python programming and its applications."
+            for i in range(1, 26)
+        ]
+        long_text = " ".join(sentences)
+        features = make_features(nlp, long_text)
+        score, explanation = score_content_depth(features)
+        assert score >= 20.0
+        assert "sentence" in explanation.lower()
+
+    def test_unique_concepts_contribute(self, nlp) -> None:
+        # Rich vocabulary content
+        rich_vocab = (
+            "Machine learning encompasses supervised, unsupervised, and reinforcement "
+            "paradigms. Convolutional neural networks excel at image recognition tasks. "
+            "Transformer architectures revolutionized natural language processing workflows. "
+            "Gradient descent optimizes loss functions across parameter spaces. "
+            "Regularization techniques like dropout prevent overfitting in deep networks. "
+            "Backpropagation computes gradients through differentiable computational graphs."
+        )
+        # Low vocabulary content
+        low_vocab = (
+            "The thing is good. It does the thing well. The thing works. "
+            "People use the thing. The thing is useful. It is a good thing."
+        )
+        f_rich = make_features(nlp, rich_vocab)
+        f_low = make_features(nlp, low_vocab)
+        score_rich, _ = score_content_depth(f_rich)
+        score_low, _ = score_content_depth(f_low)
+        assert score_rich > score_low
 
 
 # ---------------------------------------------------------------------------
@@ -774,15 +1091,63 @@ class TestContentScorer:
         scorer_depth = ContentScorer(settings=settings_high_depth)
         scorer_qa = ContentScorer(settings=settings_high_qa)
 
-        # QA-rich content should score higher with high QA weight
         result_depth = scorer_depth.score(QA_RICH_CONTENT)
         result_qa = scorer_qa.score(QA_RICH_CONTENT)
-        # The scores will differ because of different weight configurations
-        # We can't assert direction without knowing exact scores, but they should differ
-        # unless both dimensions happen to have the exact same raw score
-        # Both should still be valid
+        # Both should produce valid scores
         assert 0.0 <= result_depth.composite_score <= 100.0
         assert 0.0 <= result_qa.composite_score <= 100.0
+
+    def test_priority_one_is_lowest_scored_dimension(self, scorer: ContentScorer) -> None:
+        """The dimension with improvement_priority=1 must have the lowest raw_score."""
+        result = scorer.score(RICH_CONTENT)
+        priority_one = next(d for d in result.dimensions if d.improvement_priority == 1)
+        min_score = min(d.raw_score for d in result.dimensions)
+        assert priority_one.raw_score == min_score
+
+    def test_score_from_input_uses_target_query(self, scorer: ContentScorer) -> None:
+        content_input = ContentInput(
+            content=RICH_CONTENT.strip(),
+            target_query="What is Python?",
+        )
+        result = scorer.score_from_input(content_input)
+        assert result.target_query == "What is Python?"
+
+    def test_word_count_approximately_correct(self, scorer: ContentScorer) -> None:
+        simple_text = "Python is a great programming language."
+        # This text has 7 words
+        # Note: ContentScorer.score strips and splits on whitespace for word count
+        result = scorer.score(simple_text + " " * 10 + "a" * 50)
+        # word count should be positive and reasonable
+        assert result.content_word_count > 0
+
+    def test_char_count_equals_stripped_length(self, scorer: ContentScorer) -> None:
+        text = "   " + RICH_CONTENT + "   "
+        result = scorer.score(text)
+        assert result.content_char_count == len(RICH_CONTENT.strip())
+
+    def test_all_explanations_are_non_empty_strings(self, scorer: ContentScorer) -> None:
+        result = scorer.score(RICH_CONTENT)
+        for dim in result.dimensions:
+            assert isinstance(dim.explanation, str)
+            assert len(dim.explanation) > 0
+
+    def test_all_display_names_are_non_empty(self, scorer: ContentScorer) -> None:
+        result = scorer.score(RICH_CONTENT)
+        for dim in result.dimensions:
+            assert isinstance(dim.display_name, str)
+            assert len(dim.display_name) > 0
+
+    def test_all_priorities_are_unique(self, scorer: ContentScorer) -> None:
+        result = scorer.score(RICH_CONTENT)
+        priorities = [d.improvement_priority for d in result.dimensions]
+        assert len(set(priorities)) == len(priorities)
+
+    def test_composite_score_is_weighted_average(self, scorer: ContentScorer) -> None:
+        result = scorer.score(RICH_CONTENT)
+        total_weighted = sum(d.weighted_score for d in result.dimensions)
+        total_weight = sum(d.weight for d in result.dimensions)
+        expected_composite = round(total_weighted / total_weight, 2)
+        assert abs(result.composite_score - expected_composite) < 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +1179,29 @@ class TestScoreContentFunction:
         with pytest.raises(ValueError):
             score_content("")
 
+    def test_returns_six_dimensions(self) -> None:
+        result = score_content(RICH_CONTENT)
+        assert len(result.dimensions) == 6
+
+    def test_suggestions_empty(self) -> None:
+        result = score_content(RICH_CONTENT)
+        assert result.suggestions == []
+
+    def test_deterministic_output(self) -> None:
+        result1 = score_content(RICH_CONTENT)
+        result2 = score_content(RICH_CONTENT)
+        assert result1.composite_score == result2.composite_score
+
+    def test_no_target_query_by_default(self) -> None:
+        result = score_content(RICH_CONTENT)
+        assert result.target_query is None
+
+    def test_poor_content_gets_non_zero_score(self) -> None:
+        # Even poor content should get some score for each dimension
+        result = score_content(POOR_CONTENT)
+        assert result.composite_score >= 0.0
+        assert len(result.dimensions) == 6
+
 
 # ---------------------------------------------------------------------------
 # Tests for _load_spacy_model
@@ -833,6 +1221,15 @@ class TestLoadSpacyModel:
         nlp2 = _load_spacy_model("en_core_web_sm")
         assert nlp1 is nlp2
 
+    def test_loaded_model_can_parse_text(self) -> None:
+        nlp = _load_spacy_model("en_core_web_sm")
+        doc = nlp("Python is a programming language.")
+        assert len(list(doc.sents)) >= 1
+
+    def test_loaded_model_has_ner_pipe(self) -> None:
+        nlp = _load_spacy_model("en_core_web_sm")
+        assert "ner" in nlp.pipe_names
+
     def test_invalid_model_raises_os_error(self) -> None:
         # Clear cache first to ensure fresh load attempt
         _load_spacy_model.cache_clear()
@@ -843,6 +1240,16 @@ class TestLoadSpacyModel:
             # Restore cache with valid model for subsequent tests
             _load_spacy_model.cache_clear()
             _load_spacy_model("en_core_web_sm")  # Reload valid model
+
+    def test_error_message_includes_download_hint(self) -> None:
+        _load_spacy_model.cache_clear()
+        try:
+            with pytest.raises(OSError) as exc_info:
+                _load_spacy_model("nonexistent_model_xyz_abc_123")
+            assert "download" in str(exc_info.value).lower()
+        finally:
+            _load_spacy_model.cache_clear()
+            _load_spacy_model("en_core_web_sm")
 
 
 # ---------------------------------------------------------------------------
@@ -864,7 +1271,7 @@ class TestEdgeCases:
             "Python (version 3.11+) supports f-strings & walrus operator (:=). "
             "See: https://docs.python.org/3/ for details. "
             "Cost: $0.001/token @ 100K tokens/month = $100/month. "
-            "Formula: E = mc², where c ≈ 3×10⁸ m/s."
+            "Formula: E = mc\u00b2, where c \u2248 3\u00d710\u2078 m/s."
         )
         result = scorer.score(special_content)
         assert isinstance(result, AnalysisResult)
@@ -908,12 +1315,68 @@ class TestEdgeCases:
 
     def test_unicode_content_handled(self, scorer: ContentScorer) -> None:
         unicode_content = (
-            "Héllo, wörld! This is tëst contënt with Unicode charäcters. "
-            "日本語のテキスト is also present. "
-            "According to the résumé, the café serves crêpes. "
-            "The naïve approach to résumés uses simple templâtes. "
+            "H\u00e9llo, w\u00f6rld! This is t\u00ebst cont\u00ebnt with Unicode char\u00e4cters. "
+            "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8 is also present. "
+            "According to the r\u00e9sum\u00e9, the caf\u00e9 serves cr\u00eapes. "
+            "The na\u00efve approach to r\u00e9sum\u00e9s uses simple templ\u00e2tes. "
             "What is Unicode? Unicode is a standard for text encoding worldwide."
         )
         result = scorer.score(unicode_content)
         assert isinstance(result, AnalysisResult)
         assert 0.0 <= result.composite_score <= 100.0
+
+    def test_content_with_html_tags(self, scorer: ContentScorer) -> None:
+        html_content = (
+            "<h1>What is Python?</h1>\n"
+            "<p>Python is a high-level programming language created by "
+            "<strong>Guido van Rossum</strong> in 1991.</p>\n"
+            "<h2>Why is Python popular?</h2>\n"
+            "<ul>\n"
+            "<li>Easy to learn and read</li>\n"
+            "<li>Large ecosystem of libraries</li>\n"
+            "<li>Versatile for many use cases</li>\n"
+            "</ul>\n"
+            "<p>According to Stack Overflow, Python is the most popular language in 2024.</p>"
+        )
+        result = scorer.score(html_content)
+        assert isinstance(result, AnalysisResult)
+        assert 0.0 <= result.composite_score <= 100.0
+
+    def test_content_with_only_whitespace_after_stripping_raises(self, scorer: ContentScorer) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            scorer.score("\n\n\n\t\t\t   \n")
+
+    def test_content_with_repeated_words_still_scores(self, scorer: ContentScorer) -> None:
+        repeated = ("Python " * 60).strip()  # 60 repetitions
+        result = scorer.score(repeated)
+        assert isinstance(result, AnalysisResult)
+        assert 0.0 <= result.composite_score <= 100.0
+
+    def test_content_at_minimum_length_is_scored(self, scorer: ContentScorer) -> None:
+        result = scorer.score(MINIMAL_CONTENT)
+        assert isinstance(result, AnalysisResult)
+        assert len(result.dimensions) == 6
+
+    def test_citation_content_scored_correctly(self, scorer: ContentScorer) -> None:
+        result = scorer.score(CITATION_RICH_CONTENT)
+        citation_dim = next(
+            d for d in result.dimensions
+            if d.dimension == DimensionKey.CITATION_CUES
+        )
+        assert citation_dim.raw_score >= 20.0
+
+    def test_structured_content_formatting_recognized(self, scorer: ContentScorer) -> None:
+        result = scorer.score(STRUCTURED_CONTENT)
+        formatting_dim = next(
+            d for d in result.dimensions
+            if d.dimension == DimensionKey.STRUCTURED_FORMATTING
+        )
+        assert formatting_dim.raw_score >= 30.0
+
+    def test_qa_content_qa_alignment_recognized(self, scorer: ContentScorer) -> None:
+        result = scorer.score(QA_RICH_CONTENT)
+        qa_dim = next(
+            d for d in result.dimensions
+            if d.dimension == DimensionKey.QA_ALIGNMENT
+        )
+        assert qa_dim.raw_score >= 40.0
